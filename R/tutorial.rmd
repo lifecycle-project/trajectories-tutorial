@@ -1,0 +1,918 @@
+---
+title: "Conducting two-stage mixed effects models using DataSHIELD"
+author: Tim Cadman
+---
+
+```{r, eval = FALSE, echo = FALSE}
+setwd("/Users/timcadman/OneDrive - University of Bristol/repos/lc-mlm-tutorial")
+rmarkdown::render("./code/tutorial.rmd")
+```
+
+# Introduction
+This tutorial uses simulated data to demonstrate how to conduct two-stage mixed effects
+analysis using DataSHIELD (also described as 'trajectories').
+
+This tutorial draws on the following papers/tutorials:
+
+1. Hughes, R., Tilling, K. & Lawlor, D. Combining longitudinal data from different cohorts to examine the 
+life-course trajectory. Preprint available on medrxiv: https://doi.org/10.1101/2020.11.24.20237669 
+
+2. Tilling K, Macdonald-Wallis C, Lawlor DA, Hughes RA, Howe LD. Modelling childhood growth using 
+fractional polynomials and linear splines. Ann Nutr Metab. 2014;65(2-3):129-38. doi: 10.1159/000362695. 
+
+3. Centre for Multilevel Modelling online course. http://www.bristol.ac.uk/cmm/learning/online-course/
+
+Using data simulated by Rachel Hughes, this tutorial broadly replicates the analysis described
+in Hughes et al. cited above. However as not all of the functionality is currently available
+there are difference between the paper and this tutorial. The main things it has not been possible to 
+recreate are:
+
+1. Multiple imputation
+2. Spline models
+3. 1-stage meta-analysis ("virtual pooling")
+
+This tutorial is thus the best approximation of the methods outline in Hughes et al., using a two-stage
+rather than one-stage approach.
+
+As and when these methods become available I will add to this tutorial.
+
+Let's get started.
+
+# Installing and loading packages
+
+First we need to install the packages we need for the tutorial. If you already have these installed you can
+skip this section.
+
+```{r, install, eval = FALSE}
+library(remotes)
+install_github("datashield/DSI")
+install_github("datashield/dsBaseClient", ref = "v6.2-dev")
+install_github("lifecycle-project/ds-helper", ref = "maintenance")
+install.packages("DSMolgenicArmadillo")
+install.packages("MolgenisArmadillo")
+install.packages("tidyverse")
+install.packages("magrittr")
+install.packages("kableExtra")
+```
+
+Now we load these packages
+```{r load-packages, eval = TRUE}
+library(dsBaseClient)
+library(DSI)
+library(DSMolgenisArmadillo)
+library(MolgenisArmadillo)
+library(dsHelper)
+library(tidyverse)
+library(magrittr)
+library(kableExtra)
+
+options(datashield.progress = TRUE)
+```
+
+# Logging in and assigning data
+
+The simulated data is held on a server which you can log in to remotely. You first request a
+'token' which contains the login details. You then use this to login and assign the data.
+```{r login}
+token <- armadillo.get_token("https://armadillo.test.molgenis.org")
+
+builder <- DSI::newDSLoginBuilder()
+
+builder$append(
+server = "alspac",
+url = "https://armadillo.test.molgenis.org",
+table = "mlmalspac/tutorial/data",
+token = token,
+driver = "ArmadilloDriver")
+
+builder$append(
+server = "bcg",
+url = "https://armadillo.test.molgenis.org",
+table = "mlmbcg/tutorial/data",
+token = token,
+driver = "ArmadilloDriver")
+
+builder$append(
+server = "bib",
+url = "https://armadillo.test.molgenis.org",
+table = "mlmbib/tutorial/data",
+token = token,
+driver = "ArmadilloDriver")
+
+builder$append(
+server = "chs",
+url = "https://armadillo.test.molgenis.org",
+table = "mlmchs/tutorial/data",
+token = token,
+driver = "ArmadilloDriver")
+
+builder$append(
+server = "probit",
+url = "https://armadillo.test.molgenis.org",
+table = "mlmprobit/tutorial/data",
+token = token,
+driver = "ArmadilloDriver")
+
+logindata <- builder$build()
+
+conns <- DSI::datashield.login(logins = logindata, assign = TRUE, symbol = "data")
+```
+
+We can check that this has worked. There should be five cohorts, with a data frame
+for each cohort.
+```{r summarise} 
+ds.summary("data")
+```
+
+
+# Table 1
+Next we can produce descriptive statistics for our variables, recreating Table 1 from Hughes et al.
+This takes quite a few steps, and requires some familiarity with the 'tidyverse' approach.
+
+## Extract statistics 
+First we need to extract the relevant statistics. DataSHIELD has the core functions ds.summary and
+ds.table to describe continuous and categorical variables. However, the output of these is tricky
+to work with. We can use the dh.getStats function to extract descriptives and put them in a more
+usable format.
+
+```{r extract-stats}
+stats <- dh.getStats(
+	df = "data", 
+	vars = c("id", "age", "weight", "sex", "pat_soc"),
+	conns = conns)
+
+mat_ed <- dh.getStats(
+	df = "data", 
+	vars = c("mat_ed"),
+	conns = conns[c("alspac", "bib", "probit")])$categorical
+
+eth <- dh.getStats(
+	df = "data", 
+	vars = "ethnicity",
+	conns = conns[c("alspac", "bib")])$categorical
+
+cat_stats <- bind_rows(stats$categorical, mat_ed, eth)
+cont_stats <- stats$continuous
+```
+We now have two objects 'cat_stats' and 'cont_stats' containing descriptives for categorical and
+continuous variables.
+
+## Derive additional values
+Next we can derive a variable indicating the age range of subjects within each cohort. Note, that for
+disclosure reasons it is not possible to view the minimum and maximum values for disclosure reasons. 
+Instead we can view the range from 5% to 95%. 
+```{r summarise-ages}
+age_ranges <- cont_stats %>% 
+filter(variable == "age" & cohort != "combined") %>%
+mutate(range_95 = paste0(perc_5, " - ", perc_95)) %>%
+select(variable, cohort, range_95) %>%
+pivot_wider(names_from = "cohort", values_from = "range_95") %>%
+mutate(category = "", variable = "Age range")
+```
+
+We also need to calculate how many participants (not observations) there are within our data. This is 
+a little convoluted in DataSHIELD. We use the function 'ds.tapply.assign' to summarise the number of observations
+for each subject. The length of this created object gives us the number of subjects. 
+```{r summarise-subjects}
+ds.tapply.assign(
+	X.name = "data$weight", 
+	INDEX.names = "data$id", 
+	FUN.name = "N", 
+	newobj = "id_summary")
+
+n_subjects <- ds.length("id_summary$N")[1:length(names(conns))] %>% 
+setNames(names(conns)) %>% 
+bind_rows() %>%
+mutate(
+	variable = "No. participants", 
+	category = "") %>%
+select(variable, everything()) %>%
+mutate(across(where(is.numeric), as.character))
+```
+
+Next we summarise the total number of weight measurements for each cohort
+```{r summarise-n-measurements}
+weight_n <- cont_stats %>%
+filter(variable == "weight" & cohort != "combined") %>%
+select(cohort, variable, valid_n) %>%
+pivot_wider(names_from = "cohort", values_from = "valid_n") %>%
+mutate(category = "", variable = "Total no. weight measures") %>%
+mutate(across(where(is.numeric), as.character))
+```
+
+We also create a variable indicating the median number of weight measurements per child including
+interquartile range. We use the variable we created above showing the number of measurments for each subject
+```{r summarise-median-measurements }
+ds.asNumeric("id_summary$N", "id_summary_num")
+
+weight_med_iqr <- ds.quantileMean("id_summary_num", type = "split") %>%
+bind_rows(.id = "cohort") %>% 
+select(cohort, "5%", "50%", "95%") %>%
+rename(median = "50%", perc_5 = "5%", perc_95 = "95%") %>%
+mutate(
+	iqr = perc_95 - perc_5, 
+	med_iqr = paste0(median, " (", iqr, ")"), 
+	variable = "Median no. measures per child (IQR)", 
+	category = "") %>%
+select(variable, category, cohort, med_iqr) %>%
+pivot_wider(names_from = cohort, values_from = med_iqr)
+```
+
+Now we can summarise our categorical variables. We take the object we created earlier with this information, 
+select the summary information we want, reshape into wide format and label our categories.
+```{r summarise-categorical}
+cat_sum <- cat_stats %>%
+select(variable, cohort, category, perc_total) %>% 
+filter(cohort != "combined") %>%
+pivot_wider(names_from = "cohort", values_from = "perc_total") %>% 
+arrange(variable, category) %>%
+mutate(category = case_when(
+variable == "ethnicity" & category == 0 ~ "White",
+variable == "ethnicity" & category == 1 ~ "South Asian",
+variable == "ethnicity" & category == 2 ~ "Other",
+variable == "ethnicity" & category == "missing" ~ "Missing",
+variable == "sex" & category == 0 ~ "Male",
+variable == "sex" & category == 1 ~ "Female",
+variable == "sex" & category == "missing" ~ "Missing",
+variable == "pat_soc" & category == 0 ~ "class I or II", 
+variable == "pat_soc" & category == 1 ~ "class III", 
+variable == "pat_soc" & category == 2 ~ "class IV, V or other",
+variable == "pat_soc" & category == "missing" ~ "Missing",
+variable == "mat_ed" & category == 0 ~ "Left school at 15 or 16",
+variable == "mat_ed" & category == 1 ~ "Left school at 17 or 18",
+variable == "mat_ed" & category == 2 ~ "Degree",
+variable == "mat_ed" & category == "missing" ~ "Missing")) %>%
+mutate(across(where(is.numeric), as.character)) %>%
+mutate(variable = case_when(
+	variable == "sex" ~ "Sex", 
+	variable == "ethnicity" ~ "Ethnicity", 
+	variable == "mat_ed" ~ "Maternal Education", 
+	variable == "pat_soc" ~ "Paternal occupation")) 
+```
+
+We can also calculate the median age at last measurement for each cohort. It isn't super straightforward
+in DataSHIELD, as functions aren't designed to show min and max values. To get round this, we can use the
+function "dh.makeOutcome" to convert the repeated measures weight data to a single variable, selecting
+the latest observation with subjects have >1
+```{r}
+dh.makeOutcome(
+	df = "data", 
+	outcome = "weight", 
+	age_var = "age", 
+	bands = c(0, 18), 
+	mult_action = "latest", 
+	df_name = "latest_meas", 
+	id_var = "id", 
+	band_action = "g_le")
+
+alm <- dh.getStats(
+	df = "latest_meas", 
+	vars = "age.18")$continuous 
+
+alm_out <- alm %>%
+select(cohort, perc_5, perc_50, perc_95) %>%
+mutate(iqr = round(perc_95 - perc_50, 2),
+	   val_iqr = paste0(perc_50, " (", iqr, ")")) %>%
+select(cohort, val_iqr) %>%
+pivot_wider(
+	names_from = cohort, 
+	values_from = val_iqr) %>%
+mutate(
+	variable = "Median ALMc in years (IQR)", 
+	category = "")
+```
+
+Finally we can combine these, and use the 'kableExtra' package to make them into a nice html table
+```{r make-table}
+bind_rows(age_ranges, n_subjects, cat_sum, weight_n, weight_med_iqr, alm_out) %>%
+rename(
+	Variable = variable, 
+	Category = category, 
+	ALSPAC = alspac, 
+	BCG = bcg, 
+	BiB = bib, 
+	CHS = chs,
+	PROBIT = probit) %>%
+select(Variable, Category, ALSPAC, BCG, BiB, CHS, PROBIT) %>%
+kbl() %>% 
+kable_styling(full_width = FALSE, position = "left") %>%
+collapse_rows(valign = "top")
+```
+
+
+# Visualise weight data
+The next stage is to look at our observed outcome data. 
+
+## Scatter plot
+We can use the scatterplot function to get an overview of the data. You can see that weight increases with age, 
+but it looks like the relationship may be non-linear
+```{r scatter}
+ds.scatterPlot(x = "data$age", y = "data$weight")
+```
+
+## Mean weight by age
+We can also plot the mean weight by age for each cohort. It is a bit fiddly to do this in DataSHIELD, but
+it is possible. First we round age to the nearest year. We use a bit of a hack to do this as there isn't 
+yet a 'round' function in datashield. 
+```{r}
+ds.assign(
+	toAssign = "data$age+0.5", 
+	newobj = "age_tmp")
+
+ds.asInteger("age_tmp", newobj = "age_round")
+```
+
+We then use the function meanSdGp to summarise weight at each age (1-18). We then put the data into
+long format so that we can plot it.
+```{r mean-by-occasion}
+cohort_ref <- tibble(
+	cohort = c(names(conns), "combined"), 
+	cohort_neat = c("ALSPAC", "BCG", "BiB", "CHS", "PROBIT", "Combined"))
+
+observed <- names(conns) %>%
+map(~ds.meanSdGp(x = "data$weight", y= "age_round", type = "split", datasources = conns[.]))
+
+observed.plotdata <- observed %>%
+map(function(x){
+
+x$Mean_gp_stud %>%
+as_tibble(rownames = "age") %>%
+mutate(age = as.numeric(str_remove(age, "age_round_"))) %>%
+pivot_longer(
+	cols = -age,
+	values_to = "number", 
+	names_to = "cohort")
+}) %>%
+bind_rows() %>%
+left_join(., cohort_ref, by = "cohort") %>%
+select(-cohort) %>%
+rename(Cohort = cohort_neat)
+```
+
+Here is the plot, which replicates Figure 1 in Rachel's paper
+```{r plot}
+palette <- c("#264653", "#2a9d8f", "#E9C46A", "#F4A261", "#E76F51")
+
+ggplot() + 
+  geom_line(data = observed.plotdata, aes(x = age, y = number, colour = Cohort), size = 0.8) +
+  scale_y_continuous(limit = c(0, 80), breaks = seq(0, 80, 20), expand = c(0, 0)) +
+  xlab("Child age") +
+  ylab("Observed weight (KG)") +
+  scale_colour_manual(values = palette)
+```  
+
+Again, it doesn't look like this is a linear relationship. We will therefore fit fractional
+polynomial models to capture this non-linearity.
+
+# Preparing the data for modelling
+We will first fit a number of different models using different combinations of fractional polynomials.
+We will then compare these models to identify the one which best fits the data.
+
+First, we we need to create transformations of the age variable. We add 0.01 months onto the age variable
+to avoid trying to create impossible transformations of zero. We can use the function ds.makeAgePolys 
+to do this. This creates age to the following powers: -2, -1, -0.5, log, 0.5, 2, 3. 
+```{r make-polys, eval = FALSE}
+ds.assign(
+	toAssign = "data$age+0.01", 
+	newobj = "age")
+
+dh.dropCols(
+	df = "data", 
+	vars = "age", 
+	type = "remove", 
+	comp_var = "id", 
+	new_df_name = "data")
+
+ds.cbind(
+	x = c("data", "age"), 
+	newobj = "data")
+
+dh.makeAgePolys(
+	df = "data", 
+	agevars = "age")
+```
+
+We can check this has worked, and see the mean values for these new variables.
+```{r check-polys, eval = FALSE}
+poly_summary <- dh.getStats(
+	df = "data", 
+	vars = c("agem_2", "agem_1", "agem_0_5", "agelog", "age0_5", "age2", "age3")) 
+```
+
+We also need to create an integer version of our ID variable. 
+```{r}
+ds.asInteger(
+	x.name = "data$id", 
+	newobj = "id_int")
+
+ds.cbind(
+	x = c("data", "id_int"),
+	newobj = "data")
+```
+
+
+# Sampling the data
+The approach suggested in Hughes et al. is to take a sample of the data, find the best model and 
+test how it fits in the remaining portion of the data. We can't do that within a 1-stage approach,
+but we can take this method within the two-stage framework. We will sample 30% of the individuals
+within each cohort, find the best fitting model for that sample, then test the fit of the model
+in the remaining 70,000.
+
+As ever, this is very convoluted in DataSHIELD. ADD FULL DESCRIPTION OF BELOW
+```{r}
+ref_sub <- n_subjects %>%
+pivot_longer(
+	cols = alspac:probit, 
+	names_to = "cohort", 
+	values_to = "n_subj") %>%
+select(cohort, n_subj) %>%
+mutate(n_subj = as.numeric(n_subj))
+
+ref_sub %>%
+pmap(function(cohort, n_subj){
+
+ds.rep(
+	x1 = c(1:n_subj), 
+	times = "id_summary$N", 
+	datasources = conns[cohort], 
+	source.times = "serverside", 
+	newobj = "new_id")
+
+})
+
+ds.cbind(x = c("data", "new_id"), newobj = "data_new_id")
+
+ref_sub %>%
+pmap(function(cohort, n_subj){
+
+ds.sample(
+	x = n_subj,
+	size = n_subj*0.3, 
+	seed.as.integer = 456, 
+	newobj = "new_id", 
+	datasources = conns[cohort])
+})
+
+ds.assign(
+	toAssign = "(new_id*0)+1",
+	newobj = "sample")
+
+ds.cbind(
+	x = c("new_id", "sample"),  
+	newobj = "sample_a_tmp")
+
+ds.merge(
+	x.name = "data_new_id", 
+	y.name = "sample_a_tmp", 
+	by.x.names = "new_id",
+	by.y.names = "new_id",
+	newobj = "sample_merged", 
+	all.x = TRUE)
+
+na_replace_vec <- rep("2", length(conns))
+
+ds.replaceNA(
+	x = "sample_merged$sample", 
+	forNA = na_replace_vec, 
+	newobj = "sample")
+
+ds.cbind(
+	x = c("data", "sample"), 
+	newobj = "data")
+
+ds.dataFrameSubset(
+	df.name = "data", 
+	V1.name = "data$sample", 
+	V2.name = "1", 
+	Boolean.operator = "==", 
+	keep.NAs = FALSE, 
+	newobj = "sample_a")
+
+ds.dataFrameSubset(
+	df.name = "data", 
+	V1.name = "data$sample", 
+	V2.name = "2", 
+	Boolean.operator = "==", 
+	keep.NAs = FALSE, 
+	newobj = "sample_b")
+```
+
+## Modelling the covariance structure
+
+SPEAK TO DEMETRIS
+
+# Finding best fitting model
+The datashield function for mixed effects is ds.lmerSLMA. To streamline the fitting of multiple models, we can use
+the functions "dh.makeLmerForm" and "dh.lmeMultPoly".
+
+First we make the formulae that we need to use. The argument to "agevars" is a vector of variable names corresponding
+to the age transformations we created above. Each row of the created table has a model formula corresponding to
+a different combination of age terms.
+
+At the moment this produces formula to fit random slope models. Random intercept models are struggling to converge.
+```{r make-formula, eval = FALSE}
+weight_form <- dh.makeLmerForm(
+  outcome = "weight", 
+  idvar = "id_int", 
+  agevars = c("age", "agem_2", "agem_1", "agem_0_5", 
+              "agelog", "age0_5", "age2", "age3"))
+
+weight_form %>% print(n = Inf)
+```
+
+You can see that this has create a table whereby each row (total of 28) contains the mixed effects
+formula for different combinations of the fractional polynomials. We can now use this
+table as the input for an argument of another function I've written. The output contains a tibble with 
+the negative log likelihood in each study, the average rank of that model across all studies and
+the summed negative log likelihood. If we select based on the lowest negative log likelihood, the
+best model contains two powers: age^0.5 & age^2.
+```{r sample-a-fit, eval = FALSE}
+sample_a.fit <- dh.lmeMultPoly(
+	df = "sample_a",
+	formulae = weight_form)
+
+sample_a.fit$fit %>%
+select(model, av_rank, sum_log) %>%
+arrange(desc(sum_log))
+```
+
+Next, we can fit the two best fitting models to the validation dataset and see how they do. 
+```{r sample-full-fit, eval = FALSE}
+sample_b.fit <- dh.lmeMultPoly(
+	df = "sample_b",
+	formulae = weight_form)
+
+sample_b.fit$fit %>%
+select(model, av_rank, sum_log) %>%
+arrange(desc(sum_log))
+```
+
+As our data was simulated, we have an unrealistic situation where the models fit exactly as well
+in each cohort. However, this demonstrates the principle. 
+
+# Fitting final model including covariates
+Unfortunately, multiple imputation is not yet available within DataSHIELD. In this tutorial we fit a restricted
+version of the model specified by Rachel, excluding covariates with large degrees of missingness. Based on this
+sample, the only covariate we can include is paternal occupation. We specify this model using the full sample.
+
+```{r final-model, eval = FALSE}
+sample_full.fit <- ds.lmerSLMA(
+	dataName = "data",
+    formula = "weight ~ 1 + age0_5 + age2 + pat_soc + pat_soc*age0_5 + pat_soc*age2 + (1|id_int)")
+```
+
+# Predicted values
+We can now derive model estimated weight for different values of age, and plot these two visualise the modelled trajecotories.
+Currently there is no predict function for lmer within datashield, so we have to do this manually. 
+
+First, we create a table holding the age ranges for each cohort
+```{r}
+ages_ref <- dh.getStats(
+  df = "data",
+  vars = "age"
+)
+```
+
+Now we extract coefficients from the model using the dsHelper function "dh.lmTab". We also rename the interaction 
+coefficients to have more useable names.
+```{r}
+coefs <- dh.lmTab(
+  model = sample_full.fit, 
+  type = "lmer",
+  coh_names = names(conns),
+  direction = "long", 
+  ci_format = "separate") %>%
+  filter(coefficient == "est") %>%
+  pivot_wider(
+    names_from = variable,
+    values_from = value
+  ) %>%
+  dplyr::rename(
+  	age_0_5_pat_soc_1 = "age0_5:pat_soc1", 
+  	age_0_5_pat_soc_2 = "age0_5:pat_soc2", 
+    age_2_pat_soc_1 = "age2:pat_soc1", 
+  	age_2_pat_soc_2 = "age2:pat_soc2")
+```
+
+Next we derive predicted values at every 0.01 month, for each cohort, based on the age ranges
+in the observed data for that cohort. We also get predicted values at each combination of levels
+for paternal social class. There will be a more efficient way to do this, but i'm tired.
+```{r}
+pred <- coefs %>%
+  pmap(
+    function(cohort, intercept, age0_5, age2, pat_soc1, pat_soc2, age_0_5_pat_soc_1, age_0_5_pat_soc_2, age_2_pat_soc_1, age_2_pat_soc_2, ...) {
+      
+      pred_pat_0 <- tibble(
+        age = seq(0, 18, by = 0.01),
+        age_0_5_ref = age^0.5,
+        age_2_ref = age^2,
+        cohort = cohort,
+        pat_1_ref = 0, 
+        pat_2_ref = 0,
+        predicted = intercept + age_0_5_ref*age0_5 + age_2_ref*age2 + pat_1_ref*pat_soc1 + pat_2_ref*pat_soc2 + 
+        age_0_5_ref*pat_1_ref*age_0_5_pat_soc_1 + age_0_5_ref*pat_2_ref*age_0_5_pat_soc_2 + 
+        age_2_ref*pat_1_ref*age_2_pat_soc_1 + age_2_ref*pat_2_ref*age_2_pat_soc_2
+      )
+
+      pred_pat_1 <- tibble(
+        age = seq(0, 18, by = 0.01),
+        age_0_5_ref = age^0.5,
+        age_2_ref = age^2,
+        cohort = cohort,
+        pat_1_ref = 1, 
+        pat_2_ref = 0,
+        predicted = intercept + age_0_5_ref*age0_5 + age_2_ref*age2 + pat_1_ref*pat_soc1 + pat_2_ref*pat_soc2 + 
+        age_0_5_ref*pat_1_ref*age_0_5_pat_soc_1 + age_0_5_ref*pat_2_ref*age_0_5_pat_soc_2 + 
+        age_2_ref*pat_1_ref*age_2_pat_soc_1 + age_2_ref*pat_2_ref*age_2_pat_soc_2
+      )
+
+      pred_pat_2 <- tibble(
+        age = seq(0, 18, by = 0.01),
+        age_0_5_ref = age^0.5,
+        age_2_ref = age^2,
+        cohort = cohort,
+        pat_1_ref = 0, 
+        pat_2_ref = 1,
+        predicted = intercept + age_0_5_ref*age0_5 + age_2_ref*age2 + pat_1_ref*pat_soc1 + pat_2_ref*pat_soc2 + 
+        age_0_5_ref*pat_1_ref*age_0_5_pat_soc_1 + age_0_5_ref*pat_2_ref*age_0_5_pat_soc_2 + 
+        age_2_ref*pat_1_ref*age_2_pat_soc_1 + age_2_ref*pat_2_ref*age_2_pat_soc_2
+      )
+
+      pred <- bind_rows(pred_pat_0, pred_pat_1, pred_pat_2)
+      
+      return(pred)
+    }
+  ) %>% bind_rows() 
+```
+
+Now we trim these estimates to only include values in the observed data.
+```{r}
+age_min_max <- ages_ref$continuous %>% 
+  select(cohort_ref = cohort, perc_5, perc_95) %>%
+  mutate(perc_95 = ifelse(cohort_ref == "combined", 17.9, perc_95))
+
+pred <- age_min_max %>%
+  pmap(function(cohort_ref, perc_5, perc_95, ...){
+    
+pred %>%
+      filter(cohort == cohort_ref & between(age, perc_5, perc_95))
+  }) %>% bind_rows()
+```
+
+# Standard errors
+Next we need to calculate standard errors. At the moment we need to do this from the variance-covariance
+matrices. Again, once a predict function is developed for lmer all of this should be easier. We have not yet 
+been able to calculate the standard error for the combined estimates.
+```{r}
+pred_coh <- pred %>% 
+  filter(cohort != "combined") %>%
+  mutate(study_ref = case_when(
+    cohort == "alspac" ~ "study1",
+    cohort == "bcg" ~ "study2",
+    cohort == "bib" ~ "study3",
+    cohort == "chs" ~ "study4",
+    cohort == "probit" ~ "study5"))
+
+pred_coh_se <- pred_coh %>%
+  pmap(function(study_ref, age_0_5_ref, age_2_ref, pat_1_ref, pat_2_ref, ...){
+    
+    vcov <- sample_full.fit$output.summary[[study_ref]]$vcov
+    C <- c(1, age_0_5_ref, age_2_ref, pat_1_ref, pat_2_ref, age_0_5_ref*pat_1_ref, age_0_5_ref*pat_2_ref, age_2_ref*pat_1_ref, age_0_5_ref*pat_2_ref)
+    std.er <- sqrt(t(C) %*% vcov %*% C)
+    out <- std.er@x
+    return(out)}) %>%
+  unlist
+
+pred_coh %<>% 
+  mutate(se = pred_coh_se) %>%
+  mutate(low_ci = predicted - 1.96*se, 
+         upper_ci = predicted + 1.96*se)
+
+comb.pred <- pred %>%
+  filter(cohort == 'combined') %>%
+  mutate(low_ci = predicted, upper_ci = predicted)
+
+coh_labels <- c("ALSPAC", "BCG", "BiB", "CHS", "PROBIT", "Combined")
+
+pred.plotdata <- bind_rows(pred_coh, comb.pred) %>%
+left_join(., cohort_ref, by = "cohort") %>%
+select(-cohort) %>%
+rename(cohort = cohort_neat) %>%
+mutate(
+	cohort = factor(cohort, labels = coh_labels, levels = coh_labels, ordered = TRUE))
+```
+
+# Graphs
+Now we can plot these estimated values. Although we've calculated confidence intervals I haven't
+included them in the plot, so that the trajectories are clearer.
+
+## Predicted trajectory by cohort
+```{r}
+cohort.plotdata <- pred.plotdata %>% filter(pat_1_ref == 0 & pat_2_ref == 0 & cohort != "Combined")
+
+ggplot() + 
+  geom_line(data = cohort.plotdata, aes(x = age, y = predicted, colour = cohort), size = 0.4) +
+  scale_colour_manual(values = palette) + 
+  scale_x_continuous(limit = c(0, 20), breaks = seq(0, 20, 5), expand = c(0, 0)) + 
+  scale_y_continuous(limit = c(0, 80), breaks = seq(0, 80, 20), expand = c(0, 0)) +
+  xlab("Child age") +
+  ylab("Predicted weight") +
+  labs(colour = "Cohort") +
+  ggtitle("Predicted mean weight trajectories by cohort")
+```
+
+## Predicted trajectory by paternal occupation
+```{r}
+pat.plotdata <- pred.plotdata %>% 
+filter(cohort == "Combined") %>%
+mutate(pat_occ = case_when(
+pat_1_ref == 0 & pat_2_ref == 0 ~ "class I or II",
+pat_1_ref == 1 & pat_2_ref == 0 ~ "class III",
+pat_1_ref == 0 & pat_2_ref == 1 ~ "class IV, V or other")) %>%
+mutate(pat_occ = factor(pat_occ, ordered = TRUE))
+
+ggplot() + 
+  geom_line(data = pat.plotdata, aes(x = age, y = predicted, colour = pat_occ), size = 0.4) +
+  scale_colour_manual(values = palette) + 
+  scale_x_continuous(limit = c(0, 20), breaks = seq(0, 20, 5), expand = c(0, 0)) + 
+  scale_y_continuous(limit = c(0, 80), breaks = seq(0, 80, 20), expand = c(0, 0)) +
+  xlab("Child age") +
+  ylab("Predicted weight") +
+  labs(colour = "Paternal occupation") +
+  ggtitle("Predicted mean weight trajectories by paternal occupation")
+```
+
+
+# Checking model fit
+The final step is to see how well the model fits at different age points. Here we can approximate Table 2 
+from "Modelling Childhood Growth". First we get mean observed values between key ages by (i) creating variables
+indicating membership of that age period, (ii) taking the mean. As ever, it is fiddly,
+```{r, lastbit, eval = FALSE}
+datashield.workspace_save(conns, "tutorial_1")
+conns <- datashield.login(logindata, restore = "tutorial_1")
+
+save.image(file = 'last_section.RData')
+load(file = "last_section.RData")
+
+bands <- c(0, 1, 1, 2, 3, 5, 6, 10, 11, 15, 16, 18)
+
+pairs <- split(bands, ceiling(seq_along(bands) / 2))
+
+subnames <- unlist(
+  pairs %>% map(~ paste0("res", "_", paste0(., collapse = "_"))),
+  use.names = FALSE
+)
+
+cats <- tibble(
+    varname = rep(subnames, each = 2),
+    value = bands,
+    op = rep(c(">=", "<="), times = (length(bands) / 2)),
+    tmp = ifelse(op == ">=", "gte", "lte"),
+    new_df_name = paste0("res", tmp, value)
+  )
+
+cats %>%
+  pmap(function(value, op, new_df_name, ...) {
+    ds.Boole(
+      V1 = "data$age",
+      V2 = value,
+      Boolean.operator = op,
+      newobj = new_df_name
+    )
+  })
+
+suppressMessages(
+  assign_conditions <- cats %>%
+    group_by(varname) %>%
+    summarise(condition = paste(new_df_name, collapse = "*"))
+)
+
+assign_conditions %>%
+  pmap(function(condition, varname) {
+    ds.assign(
+      toAssign = condition,
+      newobj = varname
+    )
+  })
+
+datashield.workspace_save(conns, "tutorial_2")
+conns <- datashield.login(logindata, restore = "tutorial_2")
+
+obs_by_agecat_comb <- assign_conditions %>%
+pull(varname) %>%
+map(
+~ ds.meanSdGp(
+	x = "data$weight", 
+	y = ., 
+	type = "split")
+	)
+
+res_obs <- obs_by_agecat_comb %>%
+map(function(x){
+
+x$Mean_gp %>%
+as_tibble(rownames = "age") %>%
+slice(2)
+}) %>%
+bind_rows() %>%
+mutate(
+	age_cat = case_when(
+		age == "res_0_1_2" ~ "0_1", 
+		age == "res_1_2_2" ~ "1_2", 
+		age == "res_11_15_2" ~ "11_15", 
+		age == "res_3_5_2" ~ "3_5", 
+		age == "res_6_10_2" ~ "6_10", 
+	    age == "res_16_18_2" ~ "16_18")) %>%
+select(-age) %>%
+pivot_longer(
+	cols = alspac:probit, 
+	values_to = "observed",
+	names_to = "cohort") %>%
+left_join(., cohort_ref, by = "cohort") %>%
+select(-cohort) %>%
+rename(cohort = cohort_neat) %>%
+mutate(observed = round(observed, 2))
+
+res_pred <- pred.plotdata %>%
+mutate(
+	age_cat = case_when(
+		age > 0 & age <= 1 ~ "0_1", 
+		age >= 1 & age <= 2 ~ "1_2", 
+		age >= 3 & age <= 5 ~ "3_5", 
+		age >= 6 & age <= 10 ~ "6_10", 
+		age >= 11 & age <= 15 ~ "11_15", 
+		age >= 16 & age <= 18 ~ "16_18")
+		) %>%
+filter(!is.na(age_cat)) %>%
+group_by(age_cat, cohort) %>%
+summarise(
+	predicted = round(mean(predicted), 2),
+	low_ci = round(mean(low_ci), 2),
+	upper_ci = round(mean(upper_ci), 2))
+
+res_tab <- left_join(res_obs, res_pred, by = c("age_cat", "cohort")) %>%
+mutate(
+	difference = round(observed - predicted, 2),
+	lower_res = round(observed - upper_ci, 2),
+	higher_res = round(observed - low_ci, 2),
+	age_cat = factor(
+		age_cat, 
+		levels = c("0_1", "1_2", "3_5", "6_10", "11_15", "16_18"),
+		ordered = TRUE), 
+	limits = paste0(lower_res, " to ", higher_res)) %>%
+filter(!is.na(predicted)) %>%
+select(age_cat, cohort, observed, predicted, difference, limits) %>%
+arrange(age_cat) %>%
+mutate(age_cat = case_when(
+	age_cat == "0_1" ~ "Birth to <= 1", 
+	age_cat == "1_2" ~ "> 1 to <= 2",
+	age_cat == "3_5" ~ ">= 3 to <= 5",
+	age_cat == "6_10" ~ ">= 6 to <= 10",
+	age_cat == "11_15" ~ ">= 11 to <= 15", 
+	age_cat == "16_18" ~ ">= 16 to <= 18")) %>%
+rename(
+	"Growth period" = age_cat, 
+	"Mean observed height, cm (SD)" = observed,
+	"Mean predicted height" = predicted,
+	"Mean difference" = difference,
+	"95% limits of agreement" = limits, 
+	"Cohort" = cohort)
+
+res_tab %>%
+kbl(full_width = FALSE) %>% 
+kable_styling(full_width = FALSE, position = "left") %>%
+collapse_rows(valign = "top")
+```
+
+
+
+
+
+REPRODUCE TABLE 2 from "Modelling childhood growth"
+
+# Methodological notes: what is possible in datashield, and what isn't
+
+## 1 vs 2-stage IPD
+As a note - currently the 1-stage IPD approach described in Rachel's paper is not available. In datashield
+currently we can do a two-stage approach, whereby the models are fit separately in each cohort and combined.
+Rachel suggests two options: (1) fitting the model separately on each cohort and sum the likelihoods, (ii)
+fit the models from a random selection of the combined data, and test this on a validation dataset.
+
+In DataSHIELD we can't do option 1 at the moment as we can't virtually pool the data. However, we can get 
+close to it by doing a combination of 1+2. We can take a sample of each cohort, sum the likelihoods across 
+the sample, and then take this model and fit it to the validation sample. When we arrive a model that fits
+well for all the samples, we fit this final model separately and combine the estimates in each cohort by
+two-stage IPD. 
+
+## Modelling dependence structure of data
+In the example paper they include cohort as a fixed effect and interactions between cohort and other
+fixed effects. Because we are fitting model separately in each cohort and meta-analysing I think
+we're essentially doing the same, because the estimates for all other fixed effects are able to vary
+within each cohort.
+
+
+
+SPEAK TO PAUL: STRUGGLING TO GET RANDOM SLOPE MODELS TO CONVERGE
+
+
+
